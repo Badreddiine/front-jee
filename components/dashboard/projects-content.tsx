@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react"
 import { useRouter } from "next/navigation"
 import { useAuth } from "@/lib/auth-context"
-import { projetApi } from "@/lib/api-client"
+import { projetApi, apiCall } from "@/lib/api-client"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Plus, Search, Clock, Users, CheckCircle2, AlertCircle, X } from "lucide-react"
@@ -20,6 +20,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Textarea } from "@/components/ui/textarea"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import { useToast } from "@/hooks/use-toast"
 
 interface ProjetDTO {
   id: number
@@ -52,7 +53,20 @@ export default function ProjectsContent() {
   const [createError, setCreateError] = useState<string | null>(null)
   const [groups, setGroups] = useState<Array<{ id: number; nom: string }>>([])
   const [loadingGroups, setLoadingGroups] = useState(false)
+  const [groupError, setGroupError] = useState<string | null>(null)
+
+  // Inline Create Group state
+  const [isCreateGroupOpen, setIsCreateGroupOpen] = useState(false)
+  const [isCreatingGroup, setIsCreatingGroup] = useState(false)
+  const [createGroupError, setCreateGroupError] = useState<string | null>(null)
+  const [groupForm, setGroupForm] = useState({ nom: "", description: "", type: "PRIVE" })
+
   const [joiningProjectId, setJoiningProjectId] = useState<number | null>(null)
+  // Debug: last server request/response for project creation
+  const [lastProjectRequest, setLastProjectRequest] = useState<any | null>(null)
+  const [lastProjectResponse, setLastProjectResponse] = useState<any | null>(null)
+
+  const { toast } = useToast()
 
   // Form state
   const [formData, setFormData] = useState({
@@ -97,7 +111,13 @@ export default function ProjectsContent() {
         setLoadingGroups(true)
         const { groupeApi } = await import("@/lib/api-client")
         const data = await groupeApi.getAll()
-        setGroups(data || [])
+        const groupsData = data || []
+        setGroups(groupsData)
+
+        // If there's exactly one group, preselect it to avoid required errors
+        if (groupsData.length === 1 && !formData.groupeId) {
+          setFormData((f) => ({ ...f, groupeId: groupsData[0].id.toString() }))
+        }
       } catch (err: any) {
         console.error("Failed to load groups:", err)
         setGroups([])
@@ -131,27 +151,202 @@ export default function ProjectsContent() {
     e.preventDefault()
     setIsCreating(true)
     setCreateError(null)
+    setGroupError(null)
+
+    // Validate group selection
+    if (!formData.groupeId || formData.groupeId === "") {
+      setGroupError("Le groupe est requis pour créer un projet. Veuillez en sélectionner un.")
+      setIsCreating(false)
+      return
+    }
+
+    const groupeIdNum = parseInt(formData.groupeId, 10)
+    if (isNaN(groupeIdNum)) {
+      setGroupError("Le groupe sélectionné est invalide.")
+      setIsCreating(false)
+      return
+    }
 
     try {
-      const projectData = {
+      // Prepare payload and normalize dateEcheance to ISO if present
+      const projectData: any = {
         ...formData,
-        groupeId: parseInt(formData.groupeId),
+        groupeId: groupeIdNum,
       }
-      const newProject = await projetApi.create(projectData)
-      setProjects([...projects, newProject])
-      setIsCreateDialogOpen(false)
-      setFormData({
-        nom: "",
-        description: "",
-        theme: "",
-        visibilite: "PRIVE" as "PUBLIC" | "PRIVE",
-        dateEcheance: "",
-        groupeId: "",
-      })
+
+      // Ensure minimal required fields/defaults to avoid server-side exceptions
+      projectData.statut = projectData.statut || "EN_ATTENTE"
+      // Send creator id in body as well (some backends expect it)
+      projectData.creatorId = user?.id
+
+      if (projectData.dateEcheance) {
+        const d = new Date(projectData.dateEcheance)
+        if (isNaN(d.getTime())) {
+          setCreateError("La date d'échéance fournie est invalide")
+          setIsCreating(false)
+          return
+        }
+        projectData.dateEcheance = d.toISOString()
+      } else {
+        delete projectData.dateEcheance
+      }
+
+      // Debug: store payload being sent
+      console.debug("Creating project payload:", projectData)
+      setLastProjectRequest(projectData)
+      setLastProjectResponse(null)
+
+      let newProject: any = null
+      try {
+        newProject = await projetApi.create(projectData, user?.id)
+        console.debug("Create project response:", newProject)
+        setLastProjectResponse(newProject || null)
+
+        if (!newProject) throw new Error("Serveur: réponse vide lors de la création du projet")
+
+        setProjects([...projects, newProject])
+        setIsCreateDialogOpen(false)
+        setFormData({
+          nom: "",
+          description: "",
+          theme: "",
+          visibilite: "PRIVE" as "PUBLIC" | "PRIVE",
+          dateEcheance: "",
+          groupeId: "",
+        })
+      } catch (firstErr: any) {
+        console.warn("Primary create failed, attempting fallbacks:", firstErr)
+
+        // Fallback 1: send groupeId inside body
+        try {
+          const bodyPayload = { ...projectData, groupeId: groupeIdNum }
+          console.debug("Fallback attempt 1 - body includes groupeId:", bodyPayload)
+          setLastProjectRequest(bodyPayload)
+          const resp = await apiCall("/projets/creer", { method: "POST", body: JSON.stringify(bodyPayload) })
+          console.debug("Fallback1 response:", resp)
+          setLastProjectResponse(resp)
+          if (resp) {
+            setProjects([...projects, resp])
+            setIsCreateDialogOpen(false)
+            setFormData({ nom: "", description: "", theme: "", visibilite: "PRIVE" as "PUBLIC" | "PRIVE", dateEcheance: "", groupeId: "" })
+            toast({ title: "Projet créé (fallback)", description: "Le projet a été créé en utilisant un format alternatif." })
+            return
+          }
+        } catch (fb1Err: any) {
+          console.warn("Fallback1 failed:", fb1Err)
+          try {
+            setLastProjectResponse(JSON.parse(fb1Err.message))
+          } catch { setLastProjectResponse({ error: fb1Err.message }) }
+        }
+
+        // Fallback 2: include groupeId + idUserConnecter in query string
+        try {
+          const qs = `?groupeId=${encodeURIComponent(String(groupeIdNum))}${user?.id ? `&idUserConnecter=${encodeURIComponent(String(user.id))}` : ""}`
+          const body2: any = { ...projectData }
+          delete body2.groupeId
+          console.debug("Fallback attempt 2 - query params:", qs, "body:", body2)
+          setLastProjectRequest({ qs, body: body2 })
+          const resp2 = await apiCall(`/projets/creer${qs}`, { method: "POST", body: JSON.stringify(body2) })
+          console.debug("Fallback2 response:", resp2)
+          setLastProjectResponse(resp2)
+          if (resp2) {
+            setProjects([...projects, resp2])
+            setIsCreateDialogOpen(false)
+            setFormData({ nom: "", description: "", theme: "", visibilite: "PRIVE" as "PUBLIC" | "PRIVE", dateEcheance: "", groupeId: "" })
+            toast({ title: "Projet créé (fallback)", description: "Le projet a été créé en utilisant un format alternatif." })
+            return
+          }
+        } catch (fb2Err: any) {
+          console.warn("Fallback2 failed:", fb2Err)
+          try {
+            setLastProjectResponse(JSON.parse(fb2Err.message))
+          } catch { setLastProjectResponse({ error: fb2Err.message }) }
+        }
+
+        // Fallback 3: send nested groupe object in body (some endpoints expect nested resource)
+        try {
+          const body3: any = { ...projectData, groupe: { id: groupeIdNum } }
+          delete body3.groupeId
+          console.debug("Fallback attempt 3 - nested groupe in body:", body3)
+          setLastProjectRequest(body3)
+          const resp3 = await apiCall(`/projets/creer`, { method: "POST", body: JSON.stringify(body3) })
+          console.debug("Fallback3 response:", resp3)
+          setLastProjectResponse(resp3)
+          if (resp3) {
+            setProjects([...projects, resp3])
+            setIsCreateDialogOpen(false)
+            setFormData({ nom: "", description: "", theme: "", visibilite: "PRIVE" as "PUBLIC" | "PRIVE", dateEcheance: "", groupeId: "" })
+            toast({ title: "Projet créé (fallback)", description: "Le projet a été créé en utilisant un format alternatif." })
+            return
+          }
+        } catch (fb3Err: any) {
+          console.warn("Fallback3 failed:", fb3Err)
+          try {
+            setLastProjectResponse(JSON.parse(fb3Err.message))
+          } catch { setLastProjectResponse({ error: fb3Err.message }) }
+        }
+
+        // All attempts failed
+        throw firstErr
+      }
     } catch (err: any) {
+      console.error("Create project failed:", err)
+
+      // Prefer structured error info if apiCall attached it
+      const status = err?.status
+      const body = err?.body ?? (() => {
+        try {
+          return JSON.parse(err?.message || "")
+        } catch {
+          return { error: err?.message || "Unknown error" }
+        }
+      })()
+
+      setLastProjectResponse({ status, body })
+
       setCreateError(err.message || "Failed to create project")
+      toast({ title: "Erreur création projet", description: err.message || "Failed to create project" })
     } finally {
       setIsCreating(false)
+    }
+  }
+
+
+
+  const handleCreateGroup = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setIsCreatingGroup(true)
+    setCreateGroupError(null)
+
+    if (!groupForm.nom || groupForm.nom.trim() === "") {
+      setCreateGroupError("Le nom du groupe est requis")
+      setIsCreatingGroup(false)
+      return
+    }
+
+    if (!user) {
+      setCreateGroupError("Utilisateur non authentifié")
+      setIsCreatingGroup(false)
+      return
+    }
+
+    try {
+      const { groupeApi } = await import("@/lib/api-client")
+      const payload = { nom: groupForm.nom, description: groupForm.description, type: groupForm.type }
+      const newGroup = await groupeApi.create(payload, user.id)
+
+      // refresh groups and auto-select the new group
+      const freshGroups = await groupeApi.getAll()
+      setGroups(freshGroups || [])
+      setFormData((f) => ({ ...f, groupeId: newGroup.id.toString() }))
+
+      setIsCreateGroupOpen(false)
+      setGroupForm({ nom: "", description: "", type: "PRIVE" })
+      toast({ title: "Groupe créé", description: "Le groupe a été créé et sélectionné." })
+    } catch (err: any) {
+      setCreateGroupError(err.message || "Échec de la création du groupe")
+    } finally {
+      setIsCreatingGroup(false)
     }
   }
 
@@ -410,7 +605,7 @@ export default function ProjectsContent() {
 
       {/* Create Project Dialog */}
       <Dialog open={isCreateDialogOpen} onOpenChange={setIsCreateDialogOpen}>
-        <DialogContent className="sm:max-w-[500px]">
+        <DialogContent className="sm:max-w-125">
           <DialogHeader>
             <DialogTitle>Create New Project</DialogTitle>
             <DialogDescription>Fill in the details to create a new project.</DialogDescription>
@@ -421,17 +616,17 @@ export default function ProjectsContent() {
                 <Label htmlFor="groupeId">Group *</Label>
                 <Select 
                   value={formData.groupeId} 
-                  onValueChange={(value) => setFormData({ ...formData, groupeId: value })}
+                  onValueChange={(value) => { setFormData({ ...formData, groupeId: value }); setGroupError(null); setCreateError(null);} }
                   disabled={loadingGroups}
                   required
                 >
                   <SelectTrigger>
-                    <SelectValue placeholder={loadingGroups ? "Loading groups..." : "Select a group"} />
+                    <SelectValue placeholder={loadingGroups ? "Chargement des groupes..." : "Sélectionnez un groupe"} />
                   </SelectTrigger>
                   <SelectContent>
                     {groups.length === 0 && !loadingGroups ? (
                       <div className="px-2 py-4 text-sm text-muted-foreground text-center">
-                        No groups available. Create a group first.
+                        Aucun groupe disponible. Créez d'abord un groupe.
                       </div>
                     ) : (
                       groups.map((group) => (
@@ -442,7 +637,19 @@ export default function ProjectsContent() {
                     )}
                   </SelectContent>
                 </Select>
+                {groupError && <p className="text-destructive text-sm mt-2">{groupError}</p>}
               </div>
+
+              {!loadingGroups && groups.length === 0 && (
+                <Card className="border-dashed">
+                  <CardContent className="pt-4">
+                    <p className="text-sm text-muted-foreground mb-3">Aucun groupe disponible. Vous pouvez en créer un ici.</p>
+                    <div className="flex gap-2">
+                      <Button onClick={() => setIsCreateGroupOpen(true)}>Créer un groupe</Button>
+                    </div>
+                  </CardContent>
+                </Card>
+              )}
 
               <div className="space-y-2">
                 <Label htmlFor="nom">Project Name *</Label>
@@ -516,13 +723,96 @@ export default function ProjectsContent() {
               >
                 Cancel
               </Button>
-              <Button type="submit" disabled={isCreating}>
+              <Button type="submit" disabled={isCreating || (!loadingGroups && groups.length === 0)}>
                 {isCreating ? "Creating..." : "Create Project"}
               </Button>
             </DialogFooter>
           </form>
         </DialogContent>
       </Dialog>
+
+      {/* Create Group Dialog */}
+      <Dialog open={isCreateGroupOpen} onOpenChange={setIsCreateGroupOpen}>
+        <DialogContent className="sm:max-w-125">
+          <DialogHeader>
+            <DialogTitle>Créer un groupe</DialogTitle>
+            <DialogDescription>Créez un groupe qui pourra être sélectionné pour le projet.</DialogDescription>
+          </DialogHeader>
+          <form onSubmit={handleCreateGroup}>
+            <div className="space-y-4 py-4">
+              <div className="space-y-2">
+                <Label htmlFor="group-nom">Nom du groupe *</Label>
+                <Input
+                  id="group-nom"
+                  value={groupForm.nom}
+                  onChange={(e) => setGroupForm((s) => ({ ...s, nom: e.target.value }))}
+                  placeholder="Nom du groupe"
+                  required
+                />
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="group-description">Description</Label>
+                <Textarea
+                  id="group-description"
+                  value={groupForm.description}
+                  onChange={(e) => setGroupForm((s) => ({ ...s, description: e.target.value }))}
+                  placeholder="Description (optionnelle)"
+                />
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="group-type">Type</Label>
+                <Select value={groupForm.type} onValueChange={(v) => setGroupForm((s) => ({ ...s, type: v }))}>
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="PRIVE">Privé</SelectItem>
+                    <SelectItem value="PUBLIC">Public</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+
+              {createGroupError && (
+                <div className="text-sm text-destructive bg-destructive/10 p-3 rounded">{createGroupError}</div>
+              )}
+            </div>
+
+            <DialogFooter>
+              <Button type="button" variant="outline" onClick={() => setIsCreateGroupOpen(false)} disabled={isCreatingGroup}>
+                Annuler
+              </Button>
+              <Button type="submit" disabled={isCreatingGroup}>
+                {isCreatingGroup ? "Création..." : "Créer le groupe"}
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
+
+      {(lastProjectRequest || lastProjectResponse) && (
+        <Card className="mt-4">
+          <CardHeader>
+            <CardTitle>Debug création projet</CardTitle>
+            <CardDescription>Requête / Réponse JSON (utile pour debug)</CardDescription>
+          </CardHeader>
+          <CardContent>
+            {lastProjectRequest && (
+              <div className="mb-3">
+                <div className="text-xs font-semibold mb-1">Dernière requête :</div>
+                <pre className="text-xs overflow-auto max-h-40 whitespace-pre-wrap wrap-break-word">{JSON.stringify(lastProjectRequest, null, 2)}</pre>
+              </div>
+            )}
+            {lastProjectResponse && (
+              <div>
+                <div className="text-xs font-semibold mb-1">Dernière réponse :</div>
+                <pre className="text-xs overflow-auto max-h-40 whitespace-pre-wrap wrap-break-word">{JSON.stringify(lastProjectResponse, null, 2)}</pre>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      )}
     </div>
   )
 }

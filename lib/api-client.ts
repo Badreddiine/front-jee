@@ -55,6 +55,7 @@ export async function apiCall(endpoint: string, options: RequestInit = {}) {
       // On cherche le message le plus pertinent
       let errorMessage = `Erreur API (${response.status})`
 
+      let responseBody: any = data
       if (typeof data === "object" && data !== null) {
         // Si le backend renvoie { "message": "..." } ou { "error": "..." }
         errorMessage = data.message || data.error || JSON.stringify(data)
@@ -63,8 +64,11 @@ export async function apiCall(endpoint: string, options: RequestInit = {}) {
         errorMessage = data
       }
 
-      // On lance une erreur propre que le frontend pourra afficher directement
-      throw new Error(errorMessage)
+      // Construire une erreur enrichie avec status et body pour faciliter le debug
+      const err: any = new Error(errorMessage)
+      err.status = response.status
+      err.body = responseBody
+      throw err
     }
 
     return data
@@ -137,11 +141,20 @@ export const userApi = {
 }
 
 export const projetApi = {
-  create: (data: any) =>
-    apiCall("/projets/creer", {
+  create: (data: any, userId?: number) => {
+    // Some backend endpoints expect groupeId as a request parameter rather than in the JSON body.
+    // If present, include it in the query string and remove it from the body to avoid duplication.
+    let qs = data && data.groupeId ? `?groupeId=${encodeURIComponent(String(data.groupeId))}` : ""
+    if (userId) {
+      qs = qs ? `${qs}&idUserConnecter=${encodeURIComponent(String(userId))}` : `?idUserConnecter=${encodeURIComponent(String(userId))}`
+    }
+    const body = { ...data }
+    if (body.groupeId) delete body.groupeId
+    return apiCall(`/projets/creer${qs}`, {
       method: "POST",
-      body: JSON.stringify(data),
-    }),
+      body: JSON.stringify(body),
+    })
+  },
 
   getAll: () => apiCall("/projets/liste"),
 
