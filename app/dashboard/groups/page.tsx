@@ -21,6 +21,7 @@ import { Label } from "@/components/ui/label"
 import { Textarea } from "@/components/ui/textarea"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Badge } from "@/components/ui/badge"
+import { useToast } from "@/hooks/use-toast"
 
 interface UtilisateurDTO {
   id: number
@@ -55,11 +56,19 @@ export default function GroupsContent() {
   const [createError, setCreateError] = useState<string | null>(null)
   const [joiningGroupId, setJoiningGroupId] = useState<number | null>(null)
 
+  const { toast } = useToast()
+
+  // Local overrides for fields not persisted/returned by the backend (keyed by group id)
+  const [dateOverrides, setDateOverrides] = useState<Record<string, string>>({})
+  // Debug: last created server response
+  const [lastCreatedResponse, setLastCreatedResponse] = useState<any | null>(null)
+
   // Form state
   const [formData, setFormData] = useState({
     nom: "",
     description: "",
     type: "PRIVE" as "PUBLIC" | "PRIVE",
+    dateCreation: "",
   })
 
   useEffect(() => {
@@ -116,15 +125,145 @@ export default function GroupsContent() {
     setCreateError(null)
 
     try {
-      const newGroup = await groupeApi.create(formData, user.id)
-      setGroups([...groups, newGroup])
+      const payload: any = { ...formData }
+      if (!payload.dateCreation) delete payload.dateCreation
+      else {
+        const d = new Date(payload.dateCreation)
+        if (isNaN(d.getTime())) {
+          // invalid date format
+          setCreateError("La date fournie est invalide")
+          setIsCreating(false)
+          return
+        }
+        payload.dateCreation = d.toISOString()
+      }
+
+      console.debug("Creating group payload:", payload)
+
+      let newGroup: any = null
+      try {
+        newGroup = await groupeApi.create(payload, user.id)
+      } catch (apiErr: any) {
+        console.error("API error creating group:", apiErr)
+        // Surface backend message if available
+        setCreateError(apiErr.message || "Échec de la création du groupe")
+        setIsCreating(false)
+        return
+      }
+
+      // If server created the group but did not persist the date, try a follow-up update
+      const providedDate = payload.dateCreation || null
+      if (providedDate && newGroup?.id && !newGroup.dateCreation) {
+        try {
+          console.debug("Attempting to persist date for group via update", { id: newGroup.id, date: providedDate })
+          await groupeApi.update(newGroup.id, { dateCreation: providedDate })
+
+          // fetch the updated group to verify
+          const refreshed = await groupeApi.getById(newGroup.id)
+          if (refreshed && refreshed.dateCreation) {
+            newGroup = refreshed
+            toast({ title: "Date enregistrée", description: "La date a été enregistrée en base." })
+          } else {
+            // server still didn't persist — warn and continue with local override
+            setCreateError("Le serveur n'a pas persisté la date après la mise à jour.")
+            toast({ title: "Attention", description: "Le serveur n'a pas persisté la date après la mise à jour." })
+          }
+        } catch (updErr: any) {
+          console.error("Failed to update group date:", updErr)
+          // non-fatal: we'll fallback to local override
+          setCreateError("Impossible d'enregistrer la date sur le serveur (update échoué)")
+        }
+      }
+      try {
+        const updated = await groupeApi.getAll()
+        let patched = updated || []
+
+        if (providedDate) {
+          // 1) Try to match by returned id
+          let matchedById = false
+          let matchedId: number | null = null
+          patched = patched.map((g: any) => {
+            if (newGroup?.id && g.id === newGroup.id) {
+              matchedById = true
+              matchedId = g.id
+              return { ...g, dateCreation: g.dateCreation || providedDate }
+            }
+            return g
+          })
+
+          // 2) If not matched by id, try to match by name (best-effort)
+          if (!matchedById && newGroup?.nom) {
+            let matchedByName = false
+            let tempAppended: any | null = null
+            patched = patched.map((g: any) => {
+              if (!g.dateCreation && g.nom === newGroup.nom) {
+                matchedByName = true
+                matchedId = g.id
+                return { ...g, dateCreation: providedDate }
+              }
+              return g
+            })
+
+            // 3) If still not found, append a local temp group with the provided data so UI shows the date
+            if (!matchedByName && !newGroup?.id) {
+              const tempGroup = {
+                id: -Date.now(),
+                nom: newGroup?.nom || payload.nom || "(Sans nom)",
+                description: newGroup?.description || payload.description || "",
+                dateCreation: providedDate,
+                createur: { id: user.id, nom: user.nom || "", prenom: user.prenom || "", email: user.email || "" },
+                membres: [],
+                type: newGroup?.type || payload.type || "PRIVE",
+                nombreMembres: 1,
+              }
+              tempAppended = tempGroup
+              patched = [...patched, tempGroup]
+            }
+
+            // if we appended a tempGroup, store its id to set override below
+            if (tempAppended) matchedId = tempAppended.id
+          }
+
+          // If we found/mutated a group, ensure local override is set so the UI displays the provided date
+          if (matchedId !== null) {
+            setDateOverrides((prev) => ({ ...prev, [String(matchedId)]: providedDate }))
+          }
+        }
+
+        setGroups(patched)
+      } catch (e) {
+        // Fall back to appending the created item if refresh fails
+        if (providedDate) {
+          const appended = { ...(newGroup || {}), dateCreation: newGroup?.dateCreation || providedDate }
+          setGroups((prev) => [...prev, appended])
+          // store override so UI shows date even if backend doesn't
+          if (appended && appended.id !== undefined) {
+            setDateOverrides((prev) => ({ ...prev, [String(appended.id)]: providedDate }))
+          }
+        } else {
+          setGroups((prev) => [...prev, newGroup])
+        }
+      }
+
       setIsCreateDialogOpen(false)
       setFormData({
         nom: "",
         description: "",
         type: "PRIVE" as "PUBLIC" | "PRIVE",
+        dateCreation: "",
       })
+
+      setLastCreatedResponse(newGroup || null)
+
+      // If user provided a date but server did not return/persist it, surface a warning
+      if (providedDate && (!newGroup || !newGroup.dateCreation)) {
+        setCreateError("La date n'a pas été enregistrée par le serveur (valeur retournée null)")
+        toast({ title: "Attention", description: "La date fournie n'a pas été enregistrée par le serveur." })
+      } else {
+        toast({ title: "Groupe créé", description: newGroup?.nom ? `"${newGroup.nom}" a été créé.` : "Groupe créé" })
+      }
     } catch (err: any) {
+      console.error("Unexpected error creating group:", err)
       setCreateError(err.message || "Failed to create group")
     } finally {
       setIsCreating(false)
@@ -145,7 +284,10 @@ export default function GroupsContent() {
   }
 
   const isUserMember = (group: GroupeDTO) => {
-    return group.membres.some((membre) => membre.id === user?.id)
+    // Defensive check: API may omit `membres` for some groups
+    if (!user) return false
+    if (!Array.isArray(group.membres) || group.membres.length === 0) return false
+    return group.membres.some((membre) => membre.id === user.id)
   }
 
   const handleJoinGroup = async (groupId: number, e: React.MouseEvent) => {
@@ -280,9 +422,9 @@ export default function GroupsContent() {
                     <CardHeader>
                       <div className="flex items-start justify-between">
                         <div className="flex-1">
-                          <CardTitle className="line-clamp-2">{group.nom}</CardTitle>
+                          <CardTitle className="line-clamp-2">{group.nom || "(Sans nom)"}</CardTitle>
                           <CardDescription className="line-clamp-3 mt-2">
-                            {group.description}
+                            {group.description || "(Aucune description)"}
                           </CardDescription>
                         </div>
                         <Badge variant="outline" className={getTypeColor(group.type)}>
@@ -302,7 +444,9 @@ export default function GroupsContent() {
                           </div>
                           <div className="flex items-center gap-2 text-xs text-muted-foreground">
                             <Shield className="w-4 h-4" />
-                            <span>Created {new Date(group.dateCreation).toLocaleDateString()}</span>
+                            <span>
+                              { (dateOverrides[String(group.id)] || group.dateCreation) ? `Created ${new Date(dateOverrides[String(group.id)] || group.dateCreation).toLocaleDateString()}` : "Created —" }
+                            </span>
                           </div>
                         </div>
 
@@ -342,7 +486,7 @@ export default function GroupsContent() {
 
       {/* Create Group Dialog */}
       <Dialog open={isCreateDialogOpen} onOpenChange={setIsCreateDialogOpen}>
-        <DialogContent className="sm:max-w-[500px]">
+        <DialogContent className="sm:max-w-125">
           <DialogHeader>
             <DialogTitle>Create New Group</DialogTitle>
             <DialogDescription>Fill in the details to create a new group for collaboration.</DialogDescription>
@@ -388,6 +532,16 @@ export default function GroupsContent() {
                 </Select>
               </div>
 
+              <div className="space-y-2">
+                <Label htmlFor="dateCreation">Date (optionnelle)</Label>
+                <Input
+                  id="dateCreation"
+                  type="date"
+                  value={formData.dateCreation}
+                  onChange={(e) => setFormData({ ...formData, dateCreation: e.target.value })}
+                />
+              </div> 
+
               {createError && (
                 <div className="text-sm text-destructive bg-destructive/10 p-3 rounded">
                   {createError}
@@ -411,6 +565,18 @@ export default function GroupsContent() {
           </form>
         </DialogContent>
       </Dialog>
+
+      {lastCreatedResponse && (
+        <Card className="mt-4">
+          <CardHeader>
+            <CardTitle>Dernière réponse du serveur</CardTitle>
+            <CardDescription>Contenu JSON retourné par la création (utile pour debug)</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <pre className="text-xs overflow-auto max-h-60 whitespace-pre-wrap break-words">{JSON.stringify(lastCreatedResponse, null, 2)}</pre>
+          </CardContent>
+        </Card>
+      )}
     </div>
   )
 }

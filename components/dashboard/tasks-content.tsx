@@ -3,9 +3,22 @@
 import { useEffect, useState } from "react"
 import { useRouter } from "next/navigation"
 import { useAuth } from "@/lib/auth-context"
-import { tacheApi, type TacheDTO } from "@/lib/api-client"
+import { tacheApi, projetApi } from "@/lib/api-client"
+import type { TacheDTO } from "@/lib/types"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
+import { Textarea } from "@/components/ui/textarea"
+import { useToast } from "@/hooks/use-toast"
 import { Plus, Search, AlertCircle, Clock, CheckCircle2 } from "lucide-react"
 
 export default function TasksContent() {
@@ -17,6 +30,97 @@ export default function TasksContent() {
   const [stateFilter, setStateFilter] = useState<string>("")
   const [isLoading, setIsLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+
+  // Create Task dialog state (local to this component)
+  const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(false)
+  const [isCreating, setIsCreating] = useState(false)
+  const [createError, setCreateError] = useState<string | null>(null)
+
+  const [projects, setProjects] = useState<Array<{ id: number; nom: string }>>([])
+  const [loadingProjects, setLoadingProjects] = useState(false)
+
+  const [formData, setFormData] = useState({
+    titre: "",
+    description: "",
+    priorite: "MOYENNE",
+    dateEcheance: "",
+    projetId: "",
+  })
+
+  const [titleError, setTitleError] = useState<string | null>(null)
+  const [projectError, setProjectError] = useState<string | null>(null)
+
+  const { toast } = useToast()
+
+  useEffect(() => {
+    // reset errors when opening dialog
+    if (isCreateDialogOpen) {
+      setCreateError(null)
+      setTitleError(null)
+      setProjectError(null)
+    }
+
+    const fetchProjects = async () => {
+      if (!isCreateDialogOpen) return
+      try {
+        setLoadingProjects(true)
+        const data = await projetApi.getAll()
+        setProjects(data || [])
+      } catch (err) {
+        setProjects([])
+      } finally {
+        setLoadingProjects(false)
+      }
+    }
+
+    fetchProjects()
+  }, [isCreateDialogOpen])
+
+  const handleCreateTask = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setIsCreating(true)
+    setCreateError(null)
+    setTitleError(null)
+    setProjectError(null)
+
+    let hasError = false
+    if (!formData.titre || formData.titre.trim() === "") {
+      setTitleError("Le titre est requis")
+      hasError = true
+    }
+    if (!formData.projetId) {
+      setProjectError("Veuillez sélectionner un projet")
+      hasError = true
+    }
+
+    if (hasError) {
+      setIsCreating(false)
+      return
+    }
+
+    try {
+      const payload = {
+        titre: formData.titre,
+        description: formData.description,
+        priorite: formData.priorite,
+        dateEcheance: formData.dateEcheance || null,
+        projetId: parseInt(formData.projetId, 10),
+        etat: "A_FAIRE",
+      }
+
+      const newTask = await tacheApi.create(payload)
+      setTasks((prev) => [...prev, newTask])
+      setIsCreateDialogOpen(false)
+      setFormData({ titre: "", description: "", priorite: "MOYENNE", dateEcheance: "", projetId: "" })
+      setTitleError(null)
+      setProjectError(null)
+      toast({ title: "Task created", description: "La tâche a été créée avec succès." })
+    } catch (err: any) {
+      setCreateError(err.message || "Échec de la création de la tâche")
+    } finally {
+      setIsCreating(false)
+    }
+  }
 
   useEffect(() => {
     if (!loading && !user) {
@@ -98,10 +202,108 @@ export default function TasksContent() {
           <h1 className="text-4xl font-bold">Tasks</h1>
           <p className="text-lg text-muted-foreground">Track and manage all your tasks</p>
         </div>
-        <Button className="flex items-center gap-2">
+        <Button className="flex items-center gap-2" onClick={() => setIsCreateDialogOpen(true)}>
           <Plus className="w-4 h-4" />
           New Task
         </Button>
+
+        <Dialog open={isCreateDialogOpen} onOpenChange={(open) => setIsCreateDialogOpen(open)}>
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>New Task</DialogTitle>
+              <DialogDescription>Remplissez les informations pour créer une nouvelle tâche.</DialogDescription>
+            </DialogHeader>
+
+            <form onSubmit={handleCreateTask} className="grid gap-4">
+              <div>
+                <Label htmlFor="titre">Titre</Label>
+                <Input
+                  id="titre"
+                  value={formData.titre}
+                  onChange={(e) => { setFormData((s) => ({ ...s, titre: e.target.value })); setTitleError(null); setCreateError(null); }}
+                  placeholder="Titre de la tâche"
+                  autoFocus
+                />
+                {titleError && <p className="text-destructive text-sm mt-1">{titleError}</p>}
+              </div>
+
+              <div>
+                <Label htmlFor="description">Description</Label>
+                <Textarea
+                  id="description"
+                  value={formData.description}
+                  onChange={(e) => setFormData((s) => ({ ...s, description: e.target.value }))}
+                  placeholder="Description de la tâche"
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <Label htmlFor="priorite">Priorité</Label>
+                  <select
+                    id="priorite"
+                    value={formData.priorite}
+                    onChange={(e) => setFormData((s) => ({ ...s, priorite: e.target.value }))}
+                    className="px-3 py-2 rounded border border-border w-full"
+                  >
+                    <option value="HAUTE">HAUTE</option>
+                    <option value="MOYENNE">MOYENNE</option>
+                    <option value="BASSE">BASSE</option>
+                  </select>
+                </div>
+
+                <div>
+                  <Label htmlFor="dateEcheance">Date d'échéance</Label>
+                  <Input
+                    id="dateEcheance"
+                    type="date"
+                    value={formData.dateEcheance}
+                    onChange={(e) => setFormData((s) => ({ ...s, dateEcheance: e.target.value }))}
+                  />
+                </div>
+              </div>
+
+              <div>
+                <Label htmlFor="projet">Projet</Label>
+                {loadingProjects ? (
+                  <div className="text-sm text-muted-foreground">Chargement des projets...</div>
+                ) : projects.length === 0 ? (
+                  <Card className="border-dashed">
+                    <CardContent className="pt-4">
+                      <p className="text-sm text-muted-foreground mb-3">Aucun projet disponible. Créez d'abord un projet.</p>
+                      <Button variant="outline" onClick={() => router.push('/dashboard/projects')}>Créer un projet</Button>
+                    </CardContent>
+                  </Card>
+                ) : (
+                  <>
+                    <select
+                      id="projet"
+                      value={formData.projetId}
+                      onChange={(e) => { setFormData((s) => ({ ...s, projetId: e.target.value })); setProjectError(null); setCreateError(null); }}
+                      className="px-3 py-2 rounded border border-border w-full"
+                    >
+                      <option value="">Sélectionnez un projet</option>
+                      {projects.map((p) => (
+                        <option key={p.id} value={p.id}>
+                          {p.nom}
+                        </option>
+                      ))}
+                    </select>
+                    {projectError && <p className="text-destructive text-sm mt-1">{projectError}</p>}
+                  </>
+                )}
+              </div>
+
+              {createError && <div className="text-destructive text-sm">{createError}</div>}
+
+              <DialogFooter>
+                <Button type="submit" disabled={isCreating || (!loadingProjects && projects.length === 0)}>
+                  {isCreating ? "Création..." : "Créer la tâche"}
+                </Button>
+              </DialogFooter>
+            </form>
+          </DialogContent>
+        </Dialog>
       </div>
 
       {/* Search and Filters */}

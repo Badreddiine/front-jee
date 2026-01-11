@@ -20,6 +20,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Textarea } from "@/components/ui/textarea"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import { useToast } from "@/hooks/use-toast"
 
 interface ProjetDTO {
   id: number
@@ -52,7 +53,17 @@ export default function ProjectsContent() {
   const [createError, setCreateError] = useState<string | null>(null)
   const [groups, setGroups] = useState<Array<{ id: number; nom: string }>>([])
   const [loadingGroups, setLoadingGroups] = useState(false)
+  const [groupError, setGroupError] = useState<string | null>(null)
+
+  // Inline Create Group state
+  const [isCreateGroupOpen, setIsCreateGroupOpen] = useState(false)
+  const [isCreatingGroup, setIsCreatingGroup] = useState(false)
+  const [createGroupError, setCreateGroupError] = useState<string | null>(null)
+  const [groupForm, setGroupForm] = useState({ nom: "", description: "", type: "PRIVE" })
+
   const [joiningProjectId, setJoiningProjectId] = useState<number | null>(null)
+
+  const { toast } = useToast()
 
   // Form state
   const [formData, setFormData] = useState({
@@ -97,7 +108,13 @@ export default function ProjectsContent() {
         setLoadingGroups(true)
         const { groupeApi } = await import("@/lib/api-client")
         const data = await groupeApi.getAll()
-        setGroups(data || [])
+        const groupsData = data || []
+        setGroups(groupsData)
+
+        // If there's exactly one group, preselect it to avoid required errors
+        if (groupsData.length === 1 && !formData.groupeId) {
+          setFormData((f) => ({ ...f, groupeId: groupsData[0].id.toString() }))
+        }
       } catch (err: any) {
         console.error("Failed to load groups:", err)
         setGroups([])
@@ -131,11 +148,26 @@ export default function ProjectsContent() {
     e.preventDefault()
     setIsCreating(true)
     setCreateError(null)
+    setGroupError(null)
+
+    // Validate group selection
+    if (!formData.groupeId || formData.groupeId === "") {
+      setGroupError("Le groupe est requis pour créer un projet. Veuillez en sélectionner un.")
+      setIsCreating(false)
+      return
+    }
+
+    const groupeIdNum = parseInt(formData.groupeId, 10)
+    if (isNaN(groupeIdNum)) {
+      setGroupError("Le groupe sélectionné est invalide.")
+      setIsCreating(false)
+      return
+    }
 
     try {
       const projectData = {
         ...formData,
-        groupeId: parseInt(formData.groupeId),
+        groupeId: groupeIdNum,
       }
       const newProject = await projetApi.create(projectData)
       setProjects([...projects, newProject])
@@ -152,6 +184,43 @@ export default function ProjectsContent() {
       setCreateError(err.message || "Failed to create project")
     } finally {
       setIsCreating(false)
+    }
+  }
+
+  const handleCreateGroup = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setIsCreatingGroup(true)
+    setCreateGroupError(null)
+
+    if (!groupForm.nom || groupForm.nom.trim() === "") {
+      setCreateGroupError("Le nom du groupe est requis")
+      setIsCreatingGroup(false)
+      return
+    }
+
+    if (!user) {
+      setCreateGroupError("Utilisateur non authentifié")
+      setIsCreatingGroup(false)
+      return
+    }
+
+    try {
+      const { groupeApi } = await import("@/lib/api-client")
+      const payload = { nom: groupForm.nom, description: groupForm.description, type: groupForm.type }
+      const newGroup = await groupeApi.create(payload, user.id)
+
+      // refresh groups and auto-select the new group
+      const freshGroups = await groupeApi.getAll()
+      setGroups(freshGroups || [])
+      setFormData((f) => ({ ...f, groupeId: newGroup.id.toString() }))
+
+      setIsCreateGroupOpen(false)
+      setGroupForm({ nom: "", description: "", type: "PRIVE" })
+      toast({ title: "Groupe créé", description: "Le groupe a été créé et sélectionné." })
+    } catch (err: any) {
+      setCreateGroupError(err.message || "Échec de la création du groupe")
+    } finally {
+      setIsCreatingGroup(false)
     }
   }
 
@@ -410,7 +479,7 @@ export default function ProjectsContent() {
 
       {/* Create Project Dialog */}
       <Dialog open={isCreateDialogOpen} onOpenChange={setIsCreateDialogOpen}>
-        <DialogContent className="sm:max-w-[500px]">
+        <DialogContent className="sm:max-w-125">
           <DialogHeader>
             <DialogTitle>Create New Project</DialogTitle>
             <DialogDescription>Fill in the details to create a new project.</DialogDescription>
@@ -421,17 +490,17 @@ export default function ProjectsContent() {
                 <Label htmlFor="groupeId">Group *</Label>
                 <Select 
                   value={formData.groupeId} 
-                  onValueChange={(value) => setFormData({ ...formData, groupeId: value })}
+                  onValueChange={(value) => { setFormData({ ...formData, groupeId: value }); setGroupError(null); setCreateError(null);} }
                   disabled={loadingGroups}
                   required
                 >
                   <SelectTrigger>
-                    <SelectValue placeholder={loadingGroups ? "Loading groups..." : "Select a group"} />
+                    <SelectValue placeholder={loadingGroups ? "Chargement des groupes..." : "Sélectionnez un groupe"} />
                   </SelectTrigger>
                   <SelectContent>
                     {groups.length === 0 && !loadingGroups ? (
                       <div className="px-2 py-4 text-sm text-muted-foreground text-center">
-                        No groups available. Create a group first.
+                        Aucun groupe disponible. Créez d'abord un groupe.
                       </div>
                     ) : (
                       groups.map((group) => (
@@ -442,7 +511,19 @@ export default function ProjectsContent() {
                     )}
                   </SelectContent>
                 </Select>
+                {groupError && <p className="text-destructive text-sm mt-2">{groupError}</p>}
               </div>
+
+              {!loadingGroups && groups.length === 0 && (
+                <Card className="border-dashed">
+                  <CardContent className="pt-4">
+                    <p className="text-sm text-muted-foreground mb-3">Aucun groupe disponible. Vous pouvez en créer un ici.</p>
+                    <div className="flex gap-2">
+                      <Button onClick={() => setIsCreateGroupOpen(true)}>Créer un groupe</Button>
+                    </div>
+                  </CardContent>
+                </Card>
+              )}
 
               <div className="space-y-2">
                 <Label htmlFor="nom">Project Name *</Label>
@@ -516,8 +597,73 @@ export default function ProjectsContent() {
               >
                 Cancel
               </Button>
-              <Button type="submit" disabled={isCreating}>
+              <Button type="submit" disabled={isCreating || (!loadingGroups && groups.length === 0)}>
                 {isCreating ? "Creating..." : "Create Project"}
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
+
+      {/* Create Group Dialog */}
+      <Dialog open={isCreateGroupOpen} onOpenChange={setIsCreateGroupOpen}>
+        <DialogContent className="sm:max-w-125">
+          <DialogHeader>
+            <DialogTitle>Créer un groupe</DialogTitle>
+            <DialogDescription>Créez un groupe qui pourra être sélectionné pour le projet.</DialogDescription>
+          </DialogHeader>
+          <form onSubmit={handleCreateGroup}>
+            <div className="space-y-4 py-4">
+              <div className="space-y-2">
+                <Label htmlFor="group-nom">Nom du groupe *</Label>
+                <Input
+                  id="group-nom"
+                  value={groupForm.nom}
+                  onChange={(e) => setGroupForm((s) => ({ ...s, nom: e.target.value }))}
+                  placeholder="Nom du groupe"
+                  required
+                />
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="group-description">Description</Label>
+                <Textarea
+                  id="group-description"
+                  value={groupForm.description}
+                  onChange={(e) => setGroupForm((s) => ({ ...s, description: e.target.value }))}
+                  placeholder="Description (optionnelle)"
+                />
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="group-type">Type</Label>
+                <Select value={groupForm.type} onValueChange={(v) => setGroupForm((s) => ({ ...s, type: v }))}>
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="PRIVE">Privé</SelectItem>
+                    <SelectItem value="PUBLIC">Public</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+
+              {createGroupError && (
+                <div className="text-sm text-destructive bg-destructive/10 p-3 rounded">{createGroupError}</div>
+              )}
+            </div>
+
+            <DialogFooter>
+              <Button type="button" variant="outline" onClick={() => setIsCreateGroupOpen(false)} disabled={isCreatingGroup}>
+                Annuler
+              </Button>
+              <Button type="submit" disabled={isCreatingGroup}>
+                {isCreatingGroup ? "Création..." : "Créer le groupe"}
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
               </Button>
             </DialogFooter>
           </form>
