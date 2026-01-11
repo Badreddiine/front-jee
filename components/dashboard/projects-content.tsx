@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react"
 import { useRouter } from "next/navigation"
 import { useAuth } from "@/lib/auth-context"
-import { projetApi } from "@/lib/api-client"
+import { projetApi, apiCall } from "@/lib/api-client"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Plus, Search, Clock, Users, CheckCircle2, AlertCircle, X } from "lucide-react"
@@ -62,6 +62,9 @@ export default function ProjectsContent() {
   const [groupForm, setGroupForm] = useState({ nom: "", description: "", type: "PRIVE" })
 
   const [joiningProjectId, setJoiningProjectId] = useState<number | null>(null)
+  // Debug: last server request/response for project creation
+  const [lastProjectRequest, setLastProjectRequest] = useState<any | null>(null)
+  const [lastProjectResponse, setLastProjectResponse] = useState<any | null>(null)
 
   const { toast } = useToast()
 
@@ -165,27 +168,150 @@ export default function ProjectsContent() {
     }
 
     try {
-      const projectData = {
+      // Prepare payload and normalize dateEcheance to ISO if present
+      const projectData: any = {
         ...formData,
         groupeId: groupeIdNum,
       }
-      const newProject = await projetApi.create(projectData)
-      setProjects([...projects, newProject])
-      setIsCreateDialogOpen(false)
-      setFormData({
-        nom: "",
-        description: "",
-        theme: "",
-        visibilite: "PRIVE" as "PUBLIC" | "PRIVE",
-        dateEcheance: "",
-        groupeId: "",
-      })
+
+      // Ensure minimal required fields/defaults to avoid server-side exceptions
+      projectData.statut = projectData.statut || "EN_ATTENTE"
+      // Send creator id in body as well (some backends expect it)
+      projectData.creatorId = user?.id
+
+      if (projectData.dateEcheance) {
+        const d = new Date(projectData.dateEcheance)
+        if (isNaN(d.getTime())) {
+          setCreateError("La date d'échéance fournie est invalide")
+          setIsCreating(false)
+          return
+        }
+        projectData.dateEcheance = d.toISOString()
+      } else {
+        delete projectData.dateEcheance
+      }
+
+      // Debug: store payload being sent
+      console.debug("Creating project payload:", projectData)
+      setLastProjectRequest(projectData)
+      setLastProjectResponse(null)
+
+      let newProject: any = null
+      try {
+        newProject = await projetApi.create(projectData, user?.id)
+        console.debug("Create project response:", newProject)
+        setLastProjectResponse(newProject || null)
+
+        if (!newProject) throw new Error("Serveur: réponse vide lors de la création du projet")
+
+        setProjects([...projects, newProject])
+        setIsCreateDialogOpen(false)
+        setFormData({
+          nom: "",
+          description: "",
+          theme: "",
+          visibilite: "PRIVE" as "PUBLIC" | "PRIVE",
+          dateEcheance: "",
+          groupeId: "",
+        })
+      } catch (firstErr: any) {
+        console.warn("Primary create failed, attempting fallbacks:", firstErr)
+
+        // Fallback 1: send groupeId inside body
+        try {
+          const bodyPayload = { ...projectData, groupeId: groupeIdNum }
+          console.debug("Fallback attempt 1 - body includes groupeId:", bodyPayload)
+          setLastProjectRequest(bodyPayload)
+          const resp = await apiCall("/projets/creer", { method: "POST", body: JSON.stringify(bodyPayload) })
+          console.debug("Fallback1 response:", resp)
+          setLastProjectResponse(resp)
+          if (resp) {
+            setProjects([...projects, resp])
+            setIsCreateDialogOpen(false)
+            setFormData({ nom: "", description: "", theme: "", visibilite: "PRIVE" as "PUBLIC" | "PRIVE", dateEcheance: "", groupeId: "" })
+            toast({ title: "Projet créé (fallback)", description: "Le projet a été créé en utilisant un format alternatif." })
+            return
+          }
+        } catch (fb1Err: any) {
+          console.warn("Fallback1 failed:", fb1Err)
+          try {
+            setLastProjectResponse(JSON.parse(fb1Err.message))
+          } catch { setLastProjectResponse({ error: fb1Err.message }) }
+        }
+
+        // Fallback 2: include groupeId + idUserConnecter in query string
+        try {
+          const qs = `?groupeId=${encodeURIComponent(String(groupeIdNum))}${user?.id ? `&idUserConnecter=${encodeURIComponent(String(user.id))}` : ""}`
+          const body2: any = { ...projectData }
+          delete body2.groupeId
+          console.debug("Fallback attempt 2 - query params:", qs, "body:", body2)
+          setLastProjectRequest({ qs, body: body2 })
+          const resp2 = await apiCall(`/projets/creer${qs}`, { method: "POST", body: JSON.stringify(body2) })
+          console.debug("Fallback2 response:", resp2)
+          setLastProjectResponse(resp2)
+          if (resp2) {
+            setProjects([...projects, resp2])
+            setIsCreateDialogOpen(false)
+            setFormData({ nom: "", description: "", theme: "", visibilite: "PRIVE" as "PUBLIC" | "PRIVE", dateEcheance: "", groupeId: "" })
+            toast({ title: "Projet créé (fallback)", description: "Le projet a été créé en utilisant un format alternatif." })
+            return
+          }
+        } catch (fb2Err: any) {
+          console.warn("Fallback2 failed:", fb2Err)
+          try {
+            setLastProjectResponse(JSON.parse(fb2Err.message))
+          } catch { setLastProjectResponse({ error: fb2Err.message }) }
+        }
+
+        // Fallback 3: send nested groupe object in body (some endpoints expect nested resource)
+        try {
+          const body3: any = { ...projectData, groupe: { id: groupeIdNum } }
+          delete body3.groupeId
+          console.debug("Fallback attempt 3 - nested groupe in body:", body3)
+          setLastProjectRequest(body3)
+          const resp3 = await apiCall(`/projets/creer`, { method: "POST", body: JSON.stringify(body3) })
+          console.debug("Fallback3 response:", resp3)
+          setLastProjectResponse(resp3)
+          if (resp3) {
+            setProjects([...projects, resp3])
+            setIsCreateDialogOpen(false)
+            setFormData({ nom: "", description: "", theme: "", visibilite: "PRIVE" as "PUBLIC" | "PRIVE", dateEcheance: "", groupeId: "" })
+            toast({ title: "Projet créé (fallback)", description: "Le projet a été créé en utilisant un format alternatif." })
+            return
+          }
+        } catch (fb3Err: any) {
+          console.warn("Fallback3 failed:", fb3Err)
+          try {
+            setLastProjectResponse(JSON.parse(fb3Err.message))
+          } catch { setLastProjectResponse({ error: fb3Err.message }) }
+        }
+
+        // All attempts failed
+        throw firstErr
+      }
     } catch (err: any) {
+      console.error("Create project failed:", err)
+
+      // Prefer structured error info if apiCall attached it
+      const status = err?.status
+      const body = err?.body ?? (() => {
+        try {
+          return JSON.parse(err?.message || "")
+        } catch {
+          return { error: err?.message || "Unknown error" }
+        }
+      })()
+
+      setLastProjectResponse({ status, body })
+
       setCreateError(err.message || "Failed to create project")
+      toast({ title: "Erreur création projet", description: err.message || "Failed to create project" })
     } finally {
       setIsCreating(false)
     }
   }
+
+
 
   const handleCreateGroup = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -664,11 +790,29 @@ export default function ProjectsContent() {
           </form>
         </DialogContent>
       </Dialog>
-              </Button>
-            </DialogFooter>
-          </form>
-        </DialogContent>
-      </Dialog>
+
+      {(lastProjectRequest || lastProjectResponse) && (
+        <Card className="mt-4">
+          <CardHeader>
+            <CardTitle>Debug création projet</CardTitle>
+            <CardDescription>Requête / Réponse JSON (utile pour debug)</CardDescription>
+          </CardHeader>
+          <CardContent>
+            {lastProjectRequest && (
+              <div className="mb-3">
+                <div className="text-xs font-semibold mb-1">Dernière requête :</div>
+                <pre className="text-xs overflow-auto max-h-40 whitespace-pre-wrap wrap-break-word">{JSON.stringify(lastProjectRequest, null, 2)}</pre>
+              </div>
+            )}
+            {lastProjectResponse && (
+              <div>
+                <div className="text-xs font-semibold mb-1">Dernière réponse :</div>
+                <pre className="text-xs overflow-auto max-h-40 whitespace-pre-wrap wrap-break-word">{JSON.stringify(lastProjectResponse, null, 2)}</pre>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      )}
     </div>
   )
 }
